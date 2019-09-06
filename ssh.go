@@ -30,6 +30,7 @@ type SSH struct {
 	sshconfig           *ssh.ServerConfig
 	config              *Config
 	PublicKeyLookupFunc func(string) (*PublicKey, error)
+	RunCommandFunc      func(string, string, string, ssh.Channel) error
 }
 
 func NewSSH(config Config) *SSH {
@@ -129,45 +130,52 @@ func (s *SSH) handleConnection(keyID string, chans <-chan ssh.NewChannel) {
 						}
 					}
 
-					cmd := exec.Command(gitcmd.Command, gitcmd.Repo)
-					cmd.Dir = s.config.Dir
-					cmd.Env = append(os.Environ(), "GITKIT_KEY="+keyID)
-					// cmd.Env = append(os.Environ(), "SSH_ORIGINAL_COMMAND="+cmdName)
+					if s.RunCommandFunc != nil {
+						err := s.RunCommandFunc(gitcmd.Command, gitcmd.Repo, keyID, ch)
+						if err != nil {
+							log.Printf("error returned from command function: %v", err)
+							return
+						}
+					} else {
+						cmd := exec.Command(gitcmd.Command, gitcmd.Repo)
+						cmd.Dir = s.config.Dir
+						cmd.Env = append(os.Environ(), "GITKIT_KEY="+keyID)
+						// cmd.Env = append(os.Environ(), "SSH_ORIGINAL_COMMAND="+cmdName)
 
-					stdout, err := cmd.StdoutPipe()
-					if err != nil {
-						log.Printf("ssh: cant open stdout pipe: %v", err)
-						return
+						stdout, err := cmd.StdoutPipe()
+						if err != nil {
+							log.Printf("ssh: cant open stdout pipe: %v", err)
+							return
+						}
+
+						stderr, err := cmd.StderrPipe()
+						if err != nil {
+							log.Printf("ssh: cant open stderr pipe: %v", err)
+							return
+						}
+
+						input, err := cmd.StdinPipe()
+						if err != nil {
+							log.Printf("ssh: cant open stdin pipe: %v", err)
+							return
+						}
+
+						if err = cmd.Start(); err != nil {
+							log.Printf("ssh: start error: %v", err)
+							return
+						}
+
+						req.Reply(true, nil)
+						go io.Copy(input, ch)
+						io.Copy(ch, stdout)
+						io.Copy(ch.Stderr(), stderr)
+
+						if err = cmd.Wait(); err != nil {
+							log.Printf("ssh: command failed: %v", err)
+							return
+						}
+						ch.SendRequest("exit-status", false, []byte{0, 0, 0, 0})
 					}
-
-					stderr, err := cmd.StderrPipe()
-					if err != nil {
-						log.Printf("ssh: cant open stderr pipe: %v", err)
-						return
-					}
-
-					input, err := cmd.StdinPipe()
-					if err != nil {
-						log.Printf("ssh: cant open stdin pipe: %v", err)
-						return
-					}
-
-					if err = cmd.Start(); err != nil {
-						log.Printf("ssh: start error: %v", err)
-						return
-					}
-
-					req.Reply(true, nil)
-					go io.Copy(input, ch)
-					io.Copy(ch, stdout)
-					io.Copy(ch.Stderr(), stderr)
-
-					if err = cmd.Wait(); err != nil {
-						log.Printf("ssh: command failed: %v", err)
-						return
-					}
-
-					ch.SendRequest("exit-status", false, []byte{0, 0, 0, 0})
 					return
 				default:
 					ch.Write([]byte("Unsupported request type.\r\n"))
